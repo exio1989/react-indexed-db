@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { validateBeforeTransaction } from './Utils';
-import { ObjectStoreMeta, ObjectStoreSchema } from './indexed-hooks';
+import {IDBMigration, ObjectStoreMeta, ObjectStoreSchema} from './indexed-hooks';
 import { createReadwriteTransaction } from './createReadwriteTransaction';
 import { createReadonlyTransaction } from './createReadonlyTransaction';
 
@@ -31,24 +31,79 @@ export function openDatabase(dbName: string, version: number, upgradeCallback?: 
   });
 }
 
-export function CreateObjectStore(dbName: string, version: number, storeSchemas: ObjectStoreMeta[]) {
+function defaultMigrationBehaviour(database: IDBDatabase, storeSchemas: ObjectStoreMeta[]) {
+  storeSchemas.forEach((storeSchema: ObjectStoreMeta) => {
+    if (!database.objectStoreNames.contains(storeSchema.store)) {
+      const objectStore = database.createObjectStore(storeSchema.store, storeSchema.storeConfig);
+      storeSchema.storeSchema.forEach((schema: ObjectStoreSchema) => {
+        objectStore.createIndex(schema.name, schema.keypath, schema.options);
+      });
+    }
+  });
+
+  return true;
+}
+
+function applyMigrations(event: IDBVersionChangeEvent, database: IDBDatabase, storeSchemas: ObjectStoreMeta[], migrations: IDBMigration[]): void {
+  const oldVersion = event.oldVersion;
+  const newVersion = event.newVersion;
+  if(newVersion === null) {
+    throw new Error('New version of indexedDb hasn\'t been set');
+  }
+
+  for(let nextVersion = oldVersion+1; nextVersion < newVersion+1; nextVersion++){
+    const migration = migrations.find(x => x.toVersion === nextVersion);
+    if(!migration) {
+      throw new Error(`Db configuration should contain a migration for version ${nextVersion}`);
+    }
+
+    if(!migration.up) {
+      throw new Error(`Up callback hasn't been implemented for migration with version ${nextVersion}`);
+    }
+
+    const succeeded = migration.up(database, storeSchemas, defaultMigrationBehaviour);
+    if(!succeeded) {
+      throw new Error(`Migration for version ${nextVersion} has failed`);
+    }
+  }
+}
+
+export async function CreateObjectStore(dbName: string, version: number, storeSchemas: ObjectStoreMeta[], migrations: IDBMigration[]|undefined): Promise<void> {
   const request: IDBOpenDBRequest = indexedDB.open(dbName, version);
 
-  request.onupgradeneeded = function(event: IDBVersionChangeEvent) {
-    const database: IDBDatabase = (event.target as any).result;
-    storeSchemas.forEach((storeSchema: ObjectStoreMeta) => {
-      if (!database.objectStoreNames.contains(storeSchema.store)) {
-        const objectStore = database.createObjectStore(storeSchema.store, storeSchema.storeConfig);
-        storeSchema.storeSchema.forEach((schema: ObjectStoreSchema) => {
-          objectStore.createIndex(schema.name, schema.keypath, schema.options);
-        });
+  return new Promise((resolve, reject) => {
+    request.onupgradeneeded = function (event: IDBVersionChangeEvent) {
+      console.debug('[ReactIndexedDB] onupgradeneeded', event);
+      const database: IDBDatabase = (event.target as any).result;
+
+      try {
+        if(migrations)
+          applyMigrations(event, database, storeSchemas, migrations);
+        else
+          defaultMigrationBehaviour(database, storeSchemas);
+        resolve();
       }
-    });
-    database.close();
-  };
-  request.onsuccess = function(e: any) {
-    e.target.result.close();
-  };
+      catch (e) {
+        reject(e);
+        request.transaction!.abort();
+      }
+
+      database.close();
+    };
+    request.onsuccess = function (e: any) {
+      console.debug('[ReactIndexedDB] onsuccess', e);
+      e.target.result.close();
+      resolve();
+    };
+    request.onerror = function (ev: Event) {
+      console.debug('[ReactIndexedDB] onerror', ev);
+      reject(ev);
+    }
+    request.onblocked = function (ev: IDBVersionChangeEvent) {
+      console.debug('[ReactIndexedDB] onblocked', ev);
+      reject(ev);
+    }
+  });
 }
 
 export function DBOperations(dbName: string, version: number, currentStore: string) {
